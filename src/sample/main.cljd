@@ -1,0 +1,116 @@
+(ns sample.main
+  (:require ["package:flutter/material.dart" :as m]
+            ["package:audio_service/audio_service.dart" :as as]
+            ["package:video_player/video_player.dart" :as vp]
+            ["dart:async" :as da]
+            [cljd.flutter :as f]))
+
+(defprotocol AudioServicePlayerHandler
+  (item [this]))
+
+(defn ->audio-player-handler
+  [vc]
+  (let [sc (da/StreamController)
+        media-item (as/MediaItem
+                     .id "https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3"
+                     .album "Science Friday",
+                     .title "A Salute To Head-Scratching Science"
+                     .artist "Science Friday and WNYC Studios"
+                     .duration (Duration .milliseconds 5739820)
+                     .artUri (Uri/parse "https://media.wnyc.org/i/1400/1400/l/80/1/ScienceFriday_WNYCStudios_1400.jpg"))
+        is-playing? (fn [vc] (some-> vc
+                                     .-value
+                                     .-isPlaying))
+        processing-state (fn [vc]
+                           (cond (nil? vc) as/AudioProcessingState.idle
+                                 (some-> vc
+                                         .-value
+                                         .-isInitialized) as/AudioProcessingState.ready
+                                 :else as/AudioProcessingState.idle))
+        buffered-position (fn [vc]
+                            (some-> vc
+                                    .-value
+                                    .-buffered
+                                    (.firstWhere (fn [dr]
+                                                   (let [position (some-> vc
+                                                                          .-value
+                                                                          .-position)
+                                                         curr-dr (and (< (.-start dr) position)
+                                                                      (> (.-end dr) position))]
+                                                     (if (nil? curr-dr)
+                                                       (Duration.zero)
+                                                       (.end curr-dr)))))))
+        add-video-event (fn [sc vc]
+                          (.add sc (as/PlaybackState
+                                     .controls [as/MediaControl.rewind
+                                                (if (is-playing? vc)
+                                                  as/MediaControl.pause
+                                                  as/MediaControl.play)
+                                                as/MediaControl.stop
+                                                as/MediaControl.fastForward]
+                                     .systemActions [as/MediaAction.seek
+                                                     as/MediaAction.seekForward
+                                                     as/MediaAction.seekBackward]
+                                     .androidCompactActionIndices [0 1 3]
+                                     .processingState (processing-state vc)
+                                     .playing (is-playing? vc)
+                                     .updatePosition (or (some-> vc .-value .-position)
+                                                         (Duration.zero))
+                                     .bufferedPosition (buffered-position vc)
+                                     .speed (or (some-> vc .-value .-playbackSpeed)
+                                                1.0))))
+        start-stream (fn [vc
+                          sc]
+                       (.addListener vc (partial add-video-event sc)))
+        stop-stream (fn [vc
+                         sc]
+                      (.removeListener vc (partial add-video-event sc))
+                      (.close sc))
+        initialize-stream-controller (fn [vc]
+                                       (let [sc da/StreamController]
+                                         (sc .onListen (start-stream vc sc)
+                                             .onPause (stop-stream vc sc)
+                                             .onResume (start-stream vc sc)
+                                             .onCancel (stop-stream vc sc))))]
+    (reify :extends as/BaseAudioHandler
+      (^:async play [this]
+        (.play vc))
+      (^:async pause [this]
+        (.pause vc))
+      (^:async seek [this position]
+        (.seek vc position))
+      (^:async stop [this]
+        (.stop vc)))))
+
+(defn ^:async main []
+  (f/run
+    (m/MaterialApp
+      .title "Welcome to Flutter"
+      .theme (m/ThemeData .primarySwatch m.Colors/pink))
+    .home
+    (m/Scaffold
+      .appBar (m/AppBar
+                .title (m/Text "Welcome to ClojureDart")))
+    .body
+    m/Center
+    (f/widget
+      :managed [vc (let [v (vp/VideoPlayerController.network "https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4"
+                                                             .videoPlayerOptions (vp/VideoPlayerOptions .allowBackgroundPlayback true))]
+                     (.initialize v)
+                     v)]
+      :watch [audio-handler (when vc
+                              (as/AudioService.init
+                                .builder (fn [] (->audio-player-handler vc))
+                                .config (as/AudioServiceConfig
+                                          .androidNotificationChannelId "com.ryanheise.myapp.channel.audio"
+                                          .androidNotificationChannelName "Audio playback"
+                                          .androidNotificationOngoing true
+                                          .fastForwardInterval (Duration .seconds 30))))]
+      (m/Column .mainAxisAlignment m/MainAxisAlignment.center)
+      .children [(m/Text "A")
+                 #_(m/StreamBuilder
+                     .stream (.item audio-handler)
+                     .builder (fn [_ctx snapshot]
+                                (let [mi (.-data snapshot)]
+                                  (m/Text (.title mi)))))])))
+
