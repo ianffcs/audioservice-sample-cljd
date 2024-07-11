@@ -1,86 +1,89 @@
 (ns sample.main
   (:require ["package:flutter/material.dart" :as m]
+            ["package:flutter/widgets.dart" :as w]
             ["package:audio_service/audio_service.dart" :as as]
             ["package:video_player/video_player.dart" :as vp]
             ["dart:async" :as da]
             [cljd.flutter :as f]))
 
-(defprotocol AudioServicePlayerHandler
+(defprotocol IAudioHandler
+  (stream [this])
+  (transformEvent [this sc])
+  (stopStream [this sc])
+  (startStream [this sc])
   (item [this]))
 
-(defn ->audio-player-handler
-  [vc]
-  (let [sc (da/StreamController)
-        media-item (as/MediaItem
-                     .id "https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3"
-                     .album "Science Friday",
-                     .title "A Salute To Head-Scratching Science"
-                     .artist "Science Friday and WNYC Studios"
-                     .duration (Duration .milliseconds 5739820)
-                     .artUri (Uri/parse "https://media.wnyc.org/i/1400/1400/l/80/1/ScienceFriday_WNYCStudios_1400.jpg"))
-        is-playing? (fn [vc] (some-> vc
-                                     .-value
-                                     .-isPlaying))
-        processing-state (fn [vc]
-                           (cond (nil? vc) as/AudioProcessingState.idle
-                                 (some-> vc
+(deftype MyAudioHandler [stream-controller
+                         ^vp/VideoPlayerController video-controller]
+  :extends (as/BaseAudioHandler)
+  (play [_]
+    (.play video-controller))
+  (pause [_]
+    (.pause video-controller))
+  (stop [_]
+    (.seekTo video-controller (Duration.zero))
+    (.pause video-controller))
+  ^:mixin as/SeekHandler
+  (seek [_ ^Duration duration]
+    (.seekTo video-controller duration))
+  IAudioHandler
+  (transformEvent [this sc]
+    (fn []
+      (let [playback-st (as/PlaybackState
+                          .controls [as/MediaControl.rewind
+                                     (if (some-> video-controller .-value .-isPlaying)
+                                       as/MediaControl.pause
+                                       as/MediaControl.play)
+                                     as/MediaControl.stop
+                                     as/MediaControl.fastForward]
+                          .systemActions #{as/MediaAction.seek
+                                           as/MediaAction.seekForward
+                                           as/MediaAction.seekBackward}
+                          .androidCompactActionIndices [0 1 3]
+                          .processingState (fn [video-controller]
+                                             (if (-> video-controller
+                                                     .-value
+                                                     .-isInitialized)
+                                               as/AudioProcessingState.ready
+                                               as/AudioProcessingState.idle))
+                          .playing (some-> video-controller
+                                           .-value
+                                           .-isPlaying
+                                           boolean)
+                          .updatePosition (or (some-> video-controller
+                                                      .-value
+                                                      .-position)
+                                              (Duration.zero))
+                          .bufferedPosition (if-let [curr (some->> video-controller
+                                                                   .-value
+                                                                   .-buffered
+                                                                   (filter (fn [dur]
+                                                                             (let [pos (some-> video-controller .-value .-position)]
+                                                                               (and (> (.compareTo (.-start dur) pos) 0)
+                                                                                    (< (.compareTo (.-end dur) pos) 0)))))
+                                                                   first)]
+                                              curr
+                                              (Duration.zero))
+                          .speed (some-> video-controller
                                          .-value
-                                         .-isInitialized) as/AudioProcessingState.ready
-                                 :else as/AudioProcessingState.idle))
-        buffered-position (fn [vc]
-                            (some-> vc
-                                    .-value
-                                    .-buffered
-                                    (.firstWhere (fn [dr]
-                                                   (let [position (some-> vc
-                                                                          .-value
-                                                                          .-position)
-                                                         curr-dr (and (< (.-start dr) position)
-                                                                      (> (.-end dr) position))]
-                                                     (if (nil? curr-dr)
-                                                       (Duration.zero)
-                                                       (.end curr-dr)))))))
-        add-video-event (fn [sc vc]
-                          (.add sc (as/PlaybackState
-                                     .controls [as/MediaControl.rewind
-                                                (if (is-playing? vc)
-                                                  as/MediaControl.pause
-                                                  as/MediaControl.play)
-                                                as/MediaControl.stop
-                                                as/MediaControl.fastForward]
-                                     .systemActions [as/MediaAction.seek
-                                                     as/MediaAction.seekForward
-                                                     as/MediaAction.seekBackward]
-                                     .androidCompactActionIndices [0 1 3]
-                                     .processingState (processing-state vc)
-                                     .playing (is-playing? vc)
-                                     .updatePosition (or (some-> vc .-value .-position)
-                                                         (Duration.zero))
-                                     .bufferedPosition (buffered-position vc)
-                                     .speed (or (some-> vc .-value .-playbackSpeed)
-                                                1.0))))
-        start-stream (fn [vc
-                          sc]
-                       (.addListener vc (partial add-video-event sc)))
-        stop-stream (fn [vc
-                         sc]
-                      (.removeListener vc (partial add-video-event sc))
-                      (.close sc))
-        initialize-stream-controller (fn [vc]
-                                       (let [sc da/StreamController]
-                                         (sc .onListen (start-stream vc sc)
-                                             .onPause (stop-stream vc sc)
-                                             .onResume (start-stream vc sc)
-                                             .onCancel (stop-stream vc sc))))]
-    (reify :extends as/BaseAudioHandler
-      (^:async play [this]
-        (.play vc))
-      (^:async pause [this]
-        (.pause vc))
-      (^:async seek [this position]
-        (.seek vc position))
-      (^:async stop [this]
-        (.stop vc)))))
+                                         .-playbackSpeed
+                                         (or 1.0)))]
+        (.add sc playback-st))))
+  (startStream [this sc]
+    (.addListener video-controller
+                  (transformEvent this sc)))
+  (stopStream [this sc]
+    (.removeListener video-controller
+                     (transformEvent this sc))
+    (.close stream-controller))
+  (item [this]
+    (as/MediaItem
+      .id "https://s3.amazonaws.com/scifri-episodes/scifri20181123-episode.mp3"
+      .album "Science Friday",
+      .title "A Salute To Head-Scratching Science"
+      .artist "Science Friday and WNYC Studios"
+      .duration (Duration .milliseconds 5739820)
+      .artUri (Uri/parse "https://media.wnyc.org/i/1400/1400/l/80/1/ScienceFriday_WNYCStudios_1400.jpg"))))
 
 (defn ^:async main []
   (f/run
@@ -94,23 +97,79 @@
     .body
     m/Center
     (f/widget
-      :managed [vc (let [v (vp/VideoPlayerController.network "https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4"
-                                                             .videoPlayerOptions (vp/VideoPlayerOptions .allowBackgroundPlayback true))]
-                     (.initialize v)
-                     v)]
-      :watch [audio-handler (when vc
-                              (as/AudioService.init
-                                .builder (fn [] (->audio-player-handler vc))
-                                .config (as/AudioServiceConfig
-                                          .androidNotificationChannelId "com.ryanheise.myapp.channel.audio"
-                                          .androidNotificationChannelName "Audio playback"
-                                          .androidNotificationOngoing true
-                                          .fastForwardInterval (Duration .seconds 30))))]
+      :let [link "https://sample-videos.com/video321/mp4/480/big_buck_bunny_480p_30mb.mp4" #_"https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4"
+            _ (.ensureInitialized w/WidgetsFlutterBinding)]
+      :managed [sc (da/StreamController) :dispose .close
+                video-controller (doto (vp/VideoPlayerController.networkUrl (Uri/parse link)
+                                                                            .videoPlayerOptions (vp/VideoPlayerOptions
+                                                                                                  .allowBackgroundPlayback true))
+                                   .initialize)]
+      :let [ah ^as/AudioHandler (->MyAudioHandler sc
+                                                  video-controller)]
+      :watch [video-ready (f/$ (let [^vp/VideoPlayerValue v (f/<! video-controller)]
+                                 (and (not (.-hasError v))
+                                      (.-isInitialized v))))
+              ^vp/VideoPlayerValue {{:flds [width
+                                            height]
+                                     :or   {width  0
+                                            height 0}} .-size
+                                    :as                vp-value} video-controller]
+      :managed [s-handler (as/AudioService.init
+                            .builder (fn [] ah)
+                            .config (as/AudioServiceConfig
+                                      .androidNotificationChannelId "sample.main"
+                                      .androidNotificationChannelName "Sample Main"
+                                      .androidNotificationOngoing true
+                                      .androidShowNotificationBadge true)) :dispose nil]
+      :when (and vp-value
+                 ah)
       (m/Column .mainAxisAlignment m/MainAxisAlignment.center)
-      .children [(m/Text "A")
-                 #_(m/StreamBuilder
-                     .stream (.item audio-handler)
-                     .builder (fn [_ctx snapshot]
-                                (let [mi (.-data snapshot)]
-                                  (m/Text (.title mi)))))])))
+      .children [(m/StreamBuilder
+                   .stream (.playbackState ah)
+                   .builder (fn [_ctx snapshot]
+                              (let [mi (.-data snapshot)]
+                                (m/Text (.-title (item ah))))))
+                 (m/StreamBuilder
+                   .stream (some-> ah
+                                   .playbackState
+                                   (.map (fn [st]
+                                           (.-playing st)))
+                                   (.distinct))
+                   .builder (fn [_ctx snapshot]
+                              (let [playing (or (.-data snapshot) false)]
+                                (m/Row
+                                  .mainAxisAlignment m/MainAxisAlignment.center
+                                  .children [
+                                             (m/IconButton
+                                               .icon (m/Icon m/Icons.fast_rewind)
+                                               .iconSize 64
+                                               .onPressed (fn [] (.fastForward ah) nil))
+                                             (if playing
+                                               (m/IconButton
+                                                 .icon (m/Icon m/Icons.pause)
+                                                 .iconSize 64
+                                                 .onPressed (fn []
+                                                              (stopStream ah sc)
+                                                              (.pause ah) nil))
+                                               (m/IconButton
+                                                 .icon (m/Icon (m/Icons.play_arrow))
+                                                 .iconSize 64
+                                                 .onPressed (fn []
+                                                              (.play ah) nil)))
+                                             (m/IconButton
+                                               .icon (m/Icon m/Icons.stop)
+                                               .iconSize 64
+                                               .onPressed (fn [] (.stop ah) nil))
+                                             (m/IconButton
+                                               .icon (m/Icon m/Icons.fast_forward)
+                                               .iconSize 64
+                                               .onPressed (fn []
+                                                            (.fastForward ah)
+                                                            nil))]))))
+                 (f/widget
+                   m/Center
+                   (m/AspectRatio .aspectRatio (some->> video-controller
+                                                        .-value
+                                                        .-aspectRatio))
+                   (vp/VideoPlayer video-controller))])))
 
